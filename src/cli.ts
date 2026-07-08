@@ -1,10 +1,10 @@
 import "dotenv/config";
 
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { stepCountIs, tool, ToolLoopAgent } from "ai";
-import { Bash } from "just-bash";
-import { z } from "zod";
+import { stepCountIs, ToolLoopAgent } from "ai";
 
+import { createSandbox } from "./sandbox.js";
+import { createCodingTools } from "./tools.js";
 import { RunTrace } from "./trace.js";
 
 const apiKey = process.env.OPENROUTER_API_KEY;
@@ -23,53 +23,20 @@ const modelId = process.env.OPENROUTER_MODEL ?? "deepseek/deepseek-v4-flash";
 const openrouter = createOpenRouter({ apiKey });
 const trace = new RunTrace();
 
-const sandbox = new Bash({
-  cwd: "/workspace",
-  files: {
-    "/workspace/calculator.ts": [
-      "export function divide(a: number, b: number): number {",
-      "  return a * b; // Deliberate bug for the first experiment.",
-      "}",
-    ].join("\n"),
-  },
-});
-
-const readFile = tool({
-  description:
-    "Read a UTF-8 text file from the virtual workspace. Use this when the task depends on file contents you have not observed. Paths must start with /workspace/.",
-  inputSchema: z.object({
-    path: z.string().startsWith("/workspace/"),
-  }),
-  execute: async ({ path }) => {
-    const startedAt = performance.now();
-    const result = await sandbox.exec(`cat -- ${shellQuote(path)}`);
-    const output = {
-      path,
-      content: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode,
-    };
-    await trace.write({
-      type: "tool_result",
-      tool: "readFile",
-      path,
-      exitCode: result.exitCode,
-      durationMs: Math.round(performance.now() - startedAt),
-      outputCharacters: result.stdout.length,
-    });
-    return output;
-  },
-});
+const sandbox = createSandbox();
+const tools = createCodingTools(sandbox, trace);
 
 const agent = new ToolLoopAgent({
   model: openrouter.chat(modelId),
   instructions: [
     "You are a coding agent operating in a virtual workspace.",
     "Inspect relevant files before making claims about their contents.",
-    "For this first experiment you are read-only: explain findings and do not claim to have changed files.",
+    "Inspect relevant files before editing.",
+    "When asked to change code, verify the result with the available bash tool before claiming success.",
+    "If a tool is denied by policy, adapt to the restriction rather than claiming it ran.",
   ].join("\n"),
-  tools: { readFile },
-  stopWhen: stepCountIs(6),
+  tools,
+  stopWhen: stepCountIs(10),
 });
 
 await trace.write({ type: "run_started", modelId, task: prompt });
@@ -78,7 +45,12 @@ console.log(`trace: ${trace.filePath}\n`);
 
 const result = await agent.stream({
   prompt,
-  experimental_onToolCallStart: async ({ toolCall }) => {
+  timeout: {
+    totalMs: 60_000,
+    stepMs: 30_000,
+    chunkMs: 15_000,
+  },
+  onToolExecutionStart: async ({ toolCall }) => {
     console.error(`\n[tool] ${toolCall.toolName}`);
     await trace.write({
       type: "tool_call",
@@ -113,6 +85,7 @@ for await (const chunk of result.textStream) {
 }
 process.stdout.write("\n");
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
+// QuickJS uses a worker internally. Force a clean CLI exit after all stream
+// callbacks and trace writes have completed so an idle runtime worker cannot
+// keep this one-shot process alive.
+process.exit(0);
