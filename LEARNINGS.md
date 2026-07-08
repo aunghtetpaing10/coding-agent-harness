@@ -81,3 +81,82 @@ QuickJS execution worker held the process open. Agent lifecycle completion and
 host-process lifecycle are separate concerns. The CLI now applies total,
 per-step, and inter-chunk timeouts and exits explicitly after the completed
 stream and trace callbacks.
+
+## Experiment 3: Focused search and minimal edits
+
+### Hypothesis
+
+Focused tools reduce unnecessary context and mutation risk. A literal-search
+tool should locate the relevant file without reading the full workspace, and an
+exact edit should modify only a unique intended span instead of resending the
+whole file.
+
+### Mechanism
+
+In progress. `grep` caps returned text at 8,000 characters. `edit` requires an
+exactly-once match and records the approved mutation without storing complete
+file contents in the trace.
+
+### Observation
+
+The first run exposed two harness defects before it could serve as a clean tool
+comparison. The `grep` wrapper used an incompatible argument form and returned
+no matches, so the agent recovered through denied `find`, allowed `ls`, and two
+parallel reads. It then used `edit` successfully and verified with `js-exec`.
+The 60-second total timeout expired while the model was composing its final
+answer, leaving truncated text and no complete usage aggregate.
+
+### Conclusion
+
+Tool schemas can be valid while their execution contract is wrong; integration
+tests must cover the actual backend command. Time limits also need observability
+and calibration: a timeout that prevents runaway work can invalidate an
+otherwise successful run. The grep command is now integration-tested, timeout
+failures are traced at the stream-consumer boundary, and the bounded total
+timeout is 120 seconds.
+
+After correcting the grep contract, the repeated run followed the intended
+sequence: `grep`, `readFile`, `edit`, denied `node`, allowed `js-exec`, then a
+grounded final response. It finished normally in six steps. Focused search
+eliminated the earlier directory listing and unrelated calculator-file read.
+The run still consumed 11,250 tokens (10,052 input, 1,198 output), showing that
+fewer tool calls do not by themselves solve repeated-context cost.
+
+## Experiment 4: Bounded output and message pruning
+
+### Hypothesis
+
+Tool-output caps prevent oversized observations from entering context, while
+`prepareStep` plus `pruneMessages` removes stale reasoning and tool exchanges
+before later model calls. Both controls should reduce repeated input without
+changing task success.
+
+### Mechanism
+
+In progress. `HARNESS_CONTEXT_MODE=baseline` preserves full read output and
+message history. The default `managed` mode caps each file read at 4,000
+characters and prunes reasoning plus tool exchanges older than the last two
+messages before each step. Each preparation records message counts and
+serialized character counts before and after pruning.
+
+### Observation
+
+The unbounded baseline succeeded in nine steps but consumed 69,702 tokens:
+68,117 input and 1,585 output. The first managed policy reduced usage to 14,539
+tokens, a 79% reduction, but failed at the 10-step cap. Blanket pruning removed
+earlier command denials and file evidence, so the agent repeatedly retried
+`node`, forgot the existing self-contained verification, and created an
+unnecessary test file.
+
+### Conclusion
+
+Context reduction is an information-retention policy, not a mechanical cleanup.
+The cheapest trace is worthless if the task fails. Prevention is safer than
+cleanup: cap oversized tool output before it enters context, remove stale model
+reasoning, and prune replaceable search results while retaining mutations,
+approvals, policy denials, and verification evidence. A calibrated managed run
+then succeeded in seven steps using 17,088 tokens (15,901 input and 1,187
+output). That is about 75% fewer tokens than the 69,702-token baseline while
+preserving task success. The more aggressive 14,539-token policy was cheaper,
+but its failure demonstrates that minimum token use is not the objective;
+minimum sufficient context is.

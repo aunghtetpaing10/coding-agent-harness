@@ -1,6 +1,14 @@
 import { Bash } from "just-bash";
 
 export function createSandbox(): Bash {
+  const diagnostics = [
+    "TARGET: clamp behavior fails at both lower and upper boundaries.",
+    ...Array.from(
+      { length: 500 },
+      (_, index) => `diagnostic line ${index + 1}: repeated low-value historical output`,
+    ),
+  ].join("\n");
+
   return new Bash({
     cwd: "/workspace",
     javascript: true,
@@ -10,6 +18,7 @@ export function createSandbox(): Bash {
       maxLoopIterations: 100,
     },
     files: {
+      "/workspace/diagnostics.log": diagnostics,
       "/workspace/calculator.js": [
         "function divide(a, b) {",
         "  return a * b; // Deliberate bug for the learning experiment.",
@@ -20,6 +29,17 @@ export function createSandbox(): Bash {
         "}",
         "",
         'console.log("calculator test passed");',
+      ].join("\n"),
+      "/workspace/math.js": [
+        "function clamp(value, min, max) {",
+        "  return Math.min(min, Math.max(max, value)); // Deliberately reversed.",
+        "}",
+        "",
+        "if (clamp(12, 0, 10) !== 10 || clamp(-2, 0, 10) !== 0) {",
+        '  throw new Error("clamp specification failed");',
+        "}",
+        "",
+        'console.log("clamp test passed");',
       ].join("\n"),
     },
   });

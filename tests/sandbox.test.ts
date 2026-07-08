@@ -41,4 +41,13 @@ describe("just-bash JavaScript runtime", () => {
       stderr: "",
     });
   });
+
+  it("supports the literal-search command used by the grep tool", async () => {
+    const sandbox = createSandbox();
+
+    const result = await sandbox.exec("rg -F clamp /workspace");
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("/workspace/math.js:1:function clamp");
+  });
 });
