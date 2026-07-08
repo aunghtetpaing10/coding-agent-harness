@@ -160,3 +160,38 @@ output). That is about 75% fewer tokens than the 69,702-token baseline while
 preserving task success. The more aggressive 14,539-token policy was cheaper,
 but its failure demonstrates that minimum token use is not the objective;
 minimum sufficient context is.
+
+## Experiment 5: Tool descriptions as routing contracts
+
+### Hypothesis
+
+As the toolset grows, short capability summaries are insufficient. Explicit
+positive scenarios, soft redirects, hard negative boundaries, parameter rules,
+and concrete examples should reduce ambiguity and counter the model's tendency
+to route general work through `bash`.
+
+### Mechanism
+
+Every tool description now follows the Vercel Academy five-section contract:
+WHEN TO USE, WHEN NOT TO USE, DO NOT USE FOR, USAGE, and EXAMPLES. Summaries
+state the output shape, redirects name the appropriate alternative tool, and
+usage text reflects this harness's actual path, size, and command policies.
+
+### Observation
+
+Three real-model routing checks each selected exactly one intended tool:
+
+- Search-shaped prompt -> `grep` (2 steps, 4,652 tokens).
+- Known-file prompt -> `readFile` (2 steps, 4,615 tokens).
+- Directory-listing prompt -> `bash` (2 steps, 4,665 tokens).
+
+No prompt leaked toward the more general `bash` tool when a focused tool was
+appropriate.
+
+### Conclusion
+
+Descriptions are part of the model-facing routing API, not decorative
+documentation. The repeated negative guidance is justified because the general
+shell tool overlaps every narrower capability. Structural tests now prevent a
+new tool from silently omitting any of the five contract sections; behavioral
+routing still requires model-level evaluation.
