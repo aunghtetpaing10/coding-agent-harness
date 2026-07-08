@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { createSandbox } from "../src/sandbox.js";
+import { createJustBashSandbox } from "../src/sandbox-just-bash.js";
 
 describe("just-bash JavaScript runtime", () => {
   it("executes a self-contained JavaScript file", async () => {
-    const sandbox = createSandbox();
+    const sandbox = await createJustBashSandbox();
     await sandbox.writeFile("/workspace/self-contained.js", "console.log(1 + 2);");
 
     const result = await sandbox.exec("js-exec self-contained.js");
@@ -13,7 +13,7 @@ describe("just-bash JavaScript runtime", () => {
   });
 
   it("documents the current relative-module loading limitation", async () => {
-    const sandbox = createSandbox();
+    const sandbox = await createJustBashSandbox();
     await sandbox.writeFile(
       "/workspace/importer.js",
       'require("./calculator.js");',
@@ -26,7 +26,7 @@ describe("just-bash JavaScript runtime", () => {
   });
 
   it("executes the calculator specification after the bug is fixed", async () => {
-    const sandbox = createSandbox();
+    const sandbox = await createJustBashSandbox();
     const buggy = await sandbox.readFile("/workspace/calculator.js");
     await sandbox.writeFile(
       "/workspace/calculator.js",
@@ -43,7 +43,7 @@ describe("just-bash JavaScript runtime", () => {
   });
 
   it("supports the literal-search command used by the grep tool", async () => {
-    const sandbox = createSandbox();
+    const sandbox = await createJustBashSandbox();
 
     const result = await sandbox.exec("rg -F clamp /workspace");
 

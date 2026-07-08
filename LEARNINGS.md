@@ -262,3 +262,40 @@ the system prompt.
 every step. It removes a retrieval decision from the model and keeps the generic
 harness portable. Context still has a recurring token cost, so it should remain
 concise; larger documentation belongs behind search and read tools.
+
+## Experiment 8: Sandbox abstraction
+
+### Hypothesis
+
+Tools should depend on execution capabilities rather than the `just-bash`
+library. A small async interface should allow backend replacement without
+changing tool schemas, routing descriptions, or agent configuration.
+
+### Mechanism
+
+`Sandbox` defines backend identity, working directory, async read, write,
+existence, command execution, and cleanup, with optional expiry and snapshot
+capabilities for future cloud implementations. The `just-bash` adapter owns all
+library-specific setup. A factory selects the backend through `SANDBOX`, tools
+and project-context discovery accept only the interface, and lifecycle hooks
+bracket each CLI run with cleanup in `finally`.
+
+### Observation
+
+After refactoring, a known-file prompt still routed to `readFile` and returned
+the same first line from `math.js` in two model steps. The persisted event order
+was `sandbox_started`, agent events, `run_finished`, then `sandbox_stopping`.
+Fourteen tests pass, including backend selection, interface-level reads and
+writes, unknown-backend rejection, and existing tool behavior. Neither
+`tools.ts` nor project-context discovery imports `just-bash`, Node filesystem,
+or child-process APIs.
+
+### Conclusion
+
+The abstraction boundary now sits below tools and project discovery. Backend
+details are isolated in the adapter, while identity and lifecycle remain visible
+to the harness. We intentionally did not add a local backend: the current
+command policy and verification contract are designed for a disposable virtual
+filesystem, and exposing host execution would require a separate trust model.
+Cloud expiry and snapshots remain optional interface capabilities rather than
+fake methods on simpler backends.

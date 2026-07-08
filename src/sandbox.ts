@@ -1,54 +1,27 @@
-import { readFileSync } from "node:fs";
+export interface SandboxExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
 
-import { Bash } from "just-bash";
+export interface SandboxSnapshot {
+  snapshotId: string;
+}
 
-const projectInstructions = readFileSync(
-  new URL("../fixtures/AGENTS.md", import.meta.url),
-  "utf8",
-);
+export interface Sandbox {
+  type: string;
+  workingDirectory: string;
+  readFile(path: string): Promise<string>;
+  writeFile(path: string, content: string): Promise<void>;
+  fileExists(path: string): Promise<boolean>;
+  exec(command: string): Promise<SandboxExecResult>;
+  stop(): Promise<void>;
+  expiresAt?: number;
+  snapshot?(): Promise<SandboxSnapshot>;
+}
 
-export function createSandbox(): Bash {
-  const diagnostics = [
-    "TARGET: clamp behavior fails at both lower and upper boundaries.",
-    ...Array.from(
-      { length: 500 },
-      (_, index) => `diagnostic line ${index + 1}: repeated low-value historical output`,
-    ),
-  ].join("\n");
-
-  return new Bash({
-    cwd: "/workspace",
-    javascript: true,
-    commands: ["cat", "head", "ls", "rg", "tail", "tree", "wc"],
-    executionLimits: {
-      maxCommandCount: 100,
-      maxLoopIterations: 100,
-    },
-    files: {
-      "/workspace/AGENTS.md": projectInstructions,
-      "/workspace/diagnostics.log": diagnostics,
-      "/workspace/calculator.js": [
-        "function divide(a, b) {",
-        "  return a * b; // Deliberate bug for the learning experiment.",
-        "}",
-        "",
-        "if (divide(10, 2) !== 5) {",
-        '  throw new Error(`Expected divide(10, 2) to equal 5, received ${divide(10, 2)}`);',
-        "}",
-        "",
-        'console.log("calculator test passed");',
-      ].join("\n"),
-      "/workspace/math.js": [
-        "function clamp(value, min, max) {",
-        "  return Math.min(min, Math.max(max, value)); // Deliberately reversed.",
-        "}",
-        "",
-        "if (clamp(12, 0, 10) !== 10 || clamp(-2, 0, 10) !== 0) {",
-        '  throw new Error("clamp specification failed");',
-        "}",
-        "",
-        'console.log("clamp test passed");',
-      ].join("\n"),
-    },
-  });
+export interface SandboxLifecycle {
+  afterStart?(sandbox: Sandbox): Promise<void>;
+  beforeStop?(sandbox: Sandbox): Promise<void>;
+  onTimeout?(sandbox: Sandbox): Promise<void>;
 }

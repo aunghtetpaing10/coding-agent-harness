@@ -1,9 +1,9 @@
 import { posix } from "node:path";
 
 import { tool } from "ai";
-import type { Bash } from "just-bash";
 import { z } from "zod";
 
+import type { Sandbox } from "./sandbox.js";
 import type { RunTrace } from "./trace.js";
 
 const workspacePathSchema = z.string().refine(isWorkspacePath, {
@@ -11,7 +11,7 @@ const workspacePathSchema = z.string().refine(isWorkspacePath, {
 });
 
 export function createCodingTools(
-  sandbox: Bash,
+  sandbox: Sandbox,
   trace: RunTrace,
   options: { maximumReadCharacters?: number } = {},
 ) {

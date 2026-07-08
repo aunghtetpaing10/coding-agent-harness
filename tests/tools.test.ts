@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { createSandbox } from "../src/sandbox.js";
+import { createJustBashSandbox } from "../src/sandbox-just-bash.js";
 import { createCodingTools } from "../src/tools.js";
 import { RunTrace } from "../src/trace.js";
 
 describe("coding tool descriptions", () => {
-  it("gives every tool the full five-section routing contract", () => {
-    const tools = createCodingTools(createSandbox(), new RunTrace(), {
+  it("gives every tool the full five-section routing contract", async () => {
+    const tools = createCodingTools(await createJustBashSandbox(), new RunTrace(), {
       maximumReadCharacters: 4_000,
     });
 

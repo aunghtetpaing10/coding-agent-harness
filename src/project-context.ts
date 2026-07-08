@@ -1,15 +1,15 @@
 import { posix } from "node:path";
 
-import type { Bash } from "just-bash";
+import type { Sandbox } from "./sandbox.js";
 
 const MAXIMUM_PROJECT_CONTEXT_CHARACTERS = 8_000;
 
 export async function loadProjectContext(
-  sandbox: Bash,
+  sandbox: Sandbox,
   workingDirectory = "/workspace",
 ): Promise<string | undefined> {
   const path = posix.join(workingDirectory, "AGENTS.md");
-  if (!(await sandbox.fs.exists(path))) {
+  if (!(await sandbox.fileExists(path))) {
     return undefined;
   }
 
