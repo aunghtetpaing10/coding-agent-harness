@@ -1,4 +1,11 @@
+import { readFileSync } from "node:fs";
+
 import { Bash } from "just-bash";
+
+const projectInstructions = readFileSync(
+  new URL("../fixtures/AGENTS.md", import.meta.url),
+  "utf8",
+);
 
 export function createSandbox(): Bash {
   const diagnostics = [
@@ -18,6 +25,7 @@ export function createSandbox(): Bash {
       maxLoopIterations: 100,
     },
     files: {
+      "/workspace/AGENTS.md": projectInstructions,
       "/workspace/diagnostics.log": diagnostics,
       "/workspace/calculator.js": [
         "function divide(a, b) {",

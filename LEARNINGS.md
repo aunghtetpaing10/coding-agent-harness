@@ -195,3 +195,70 @@ documentation. The repeated negative guidance is justified because the general
 shell tool overlaps every narrower capability. Structural tests now prevent a
 new tool from silently omitting any of the five contract sections; behavioral
 routing still requires model-level evaluation.
+
+## Experiment 6: Dynamic system prompt and verification contract
+
+### Hypothesis
+
+A typed, pure prompt builder makes agent behavior depend explicitly on runtime
+state and makes critical instructions testable. A verification section should
+reduce unsupported claims by requiring tool evidence and scoped reporting.
+
+### Mechanism
+
+`buildSystemPrompt(context)` now composes Agency, Guardrails, and Verification
+sections from the working directory, sandbox type, actual tool names, and
+runtime-specific verification guidance. Git branch and `AGENTS.md` project
+context are optional sections. The verification contract distinguishes passed,
+failed, blocked, unavailable, and timed-out checks and prohibits blanket success
+claims without successful tool results.
+
+### Observation
+
+The behavioral run used the minimal sequence `readFile`, `edit`, `bash` and
+selected the documented `js-exec /workspace/math.js` verifier directly. It did
+not first attempt the unavailable `node` command. The final report named the
+exact command, quoted the observed stdout (`clamp test passed`), reported exit
+code 0, and scoped its claim to the built-in self-test. The run finished in four
+steps using 11,921 tokens.
+
+### Conclusion
+
+Dynamic prompt construction makes runtime differences explicit and testable;
+the same builder can later receive a reduced tool list for a subagent or
+project-specific `AGENTS.md` context. Verification prompting does not prove
+correctness by itself, but it improves claim discipline: successful reports
+must be grounded in actual tool results, while blocked or unavailable checks
+must remain visible.
+
+## Experiment 7: Project context from AGENTS.md
+
+### Hypothesis
+
+Project-specific facts should come from the workspace rather than accumulating
+in the generic harness prompt. Discovering `AGENTS.md` at startup makes those
+instructions consistently available without requiring the model to choose a
+retrieval tool first.
+
+### Mechanism
+
+The harness checks `/workspace/AGENTS.md` through the active sandbox backend,
+loads non-empty content up to 8,000 characters, and passes it to
+`buildSystemPrompt` as `projectContext`. Trace metadata records presence and
+size without duplicating the content. The base prompt remains valid when the
+file is absent.
+
+### Observation
+
+The trace recorded 490 project-context characters loaded. Asked for the project
+codename and verification command, the agent answered `Pocket Harness` and
+`js-exec /workspace/math.js` in one model step with zero tool calls. Those facts
+were available before action selection because the harness injected them into
+the system prompt.
+
+### Conclusion
+
+`AGENTS.md` is passive, project-owned configuration for facts that should affect
+every step. It removes a retrieval decision from the model and keeps the generic
+harness portable. Context still has a recurring token cost, so it should remain
+concise; larger documentation belongs behind search and read tools.

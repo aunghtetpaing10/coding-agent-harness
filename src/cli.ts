@@ -3,7 +3,9 @@ import "dotenv/config";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { pruneMessages, stepCountIs, ToolLoopAgent } from "ai";
 
+import { loadProjectContext } from "./project-context.js";
 import { createSandbox } from "./sandbox.js";
+import { buildSystemPrompt } from "./system.js";
 import { createCodingTools } from "./tools.js";
 import { RunTrace } from "./trace.js";
 
@@ -25,21 +27,22 @@ const openrouter = createOpenRouter({ apiKey });
 const trace = new RunTrace();
 
 const sandbox = createSandbox();
+const projectContext = await loadProjectContext(sandbox);
 const tools = createCodingTools(sandbox, trace, {
   maximumReadCharacters: contextMode === "managed" ? 4_000 : undefined,
 });
 
 const agent = new ToolLoopAgent({
   model: openrouter.chat(modelId),
-  instructions: [
-    "You are a coding agent operating in a virtual workspace.",
-    "Inspect relevant files before making claims about their contents.",
-    "Inspect relevant files before editing.",
-    "Use grep to locate symbols when the relevant file is unknown.",
-    "Prefer edit over writeFile for small, exact changes.",
-    "When asked to change code, verify the result with the available bash tool before claiming success.",
-    "If a tool is denied by policy, adapt to the restriction rather than claiming it ran.",
-  ].join("\n"),
+  instructions: buildSystemPrompt({
+    workingDirectory: "/workspace",
+    sandboxType:
+      "just-bash in-memory virtual filesystem with restricted QuickJS execution",
+    toolNames: Object.keys(tools),
+    projectContext,
+    verificationHint:
+      "Use bash with js-exec on a self-contained workspace .js or .ts file. node, npm, and external binaries are unavailable.",
+  }),
   tools,
   stopWhen: stepCountIs(10),
   maxOutputTokens: 800,
@@ -72,7 +75,14 @@ const agent = new ToolLoopAgent({
   },
 });
 
-await trace.write({ type: "run_started", modelId, contextMode, task: prompt });
+await trace.write({
+  type: "run_started",
+  modelId,
+  contextMode,
+  projectContextLoaded: projectContext !== undefined,
+  projectContextCharacters: projectContext?.length ?? 0,
+  task: prompt,
+});
 console.log(`model: ${modelId}`);
 console.log(`context: ${contextMode}`);
 console.log(`trace: ${trace.filePath}\n`);
