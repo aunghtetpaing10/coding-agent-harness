@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { LanguageModel } from "ai";
 
+import { createApproval } from "../src/approval.js";
 import { createJustBashSandbox } from "../src/sandbox-just-bash.js";
 import { createAskUserTool, createCodingTools } from "../src/tools.js";
 import { RunTrace } from "../src/trace.js";
@@ -169,5 +170,87 @@ describe("coding tool descriptions", () => {
     await expect(sandbox.readFile("/workspace/auth.js")).resolves.toContain(
       "function authenticate",
     );
+  });
+
+  it("auto-approves new virtual workspace files", async () => {
+    const sandbox = await createJustBashSandbox();
+    const tools = createCodingTools(sandbox, new RunTrace());
+    const writeFile = (tools as Record<string, { execute: Function }>).writeFile;
+
+    const result = await writeFile!.execute(
+      {
+        path: "/workspace/new-fixture.js",
+        content: "console.log('ok');",
+      },
+      {
+        toolCallId: "test-call",
+        messages: [],
+        context: {},
+      },
+    );
+
+    expect(result).toMatchObject({ success: true });
+    await expect(sandbox.readFile("/workspace/new-fixture.js")).resolves.toBe(
+      "console.log('ok');",
+    );
+  });
+
+  it("implements the three approval gate modes from config", () => {
+    const interactive = createApproval({ mode: "interactive" });
+    const background = createApproval({ mode: "background" });
+    const delegated = createApproval({
+      mode: "delegated",
+      trust: ["js-exec /workspace/math.js"],
+    });
+
+    expect(interactive({ command: "ls -la /workspace" })).toBe(false);
+    expect(interactive({ command: "npm install express" })).toBe(true);
+    expect(background({ command: "npm install express" })).toBe(false);
+    expect(delegated({ command: "js-exec /workspace/math.js" })).toBe(false);
+    expect(delegated({ command: "js-exec /workspace/calculator.js" })).toBe(
+      true,
+    );
+  });
+
+  it("blocks bash commands that need approval in interactive mode", async () => {
+    const sandbox = await createJustBashSandbox();
+    const tools = createCodingTools(sandbox, new RunTrace());
+    const bash = (tools as Record<string, { execute: Function }>).bash;
+
+    const result = await bash!.execute(
+      { command: "node /workspace/math.js" },
+      {
+        toolCallId: "test-call",
+        messages: [],
+        context: {},
+      },
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      requiresApproval: true,
+    });
+  });
+
+  it("keeps command execution policy separate from approval outcome", async () => {
+    const sandbox = await createJustBashSandbox();
+    const tools = createCodingTools(sandbox, new RunTrace(), {
+      approvalConfig: { mode: "background" },
+    });
+    const bash = (tools as Record<string, { execute: Function }>).bash;
+
+    const result = await bash!.execute(
+      { command: "node /workspace/math.js" },
+      {
+        toolCallId: "test-call",
+        messages: [],
+        context: {},
+      },
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+    });
+    expect(result.error).toContain("executable policy");
   });
 });

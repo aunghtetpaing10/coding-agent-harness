@@ -5,6 +5,7 @@ import { createInterface } from "node:readline/promises";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { pruneMessages, stepCountIs, ToolLoopAgent } from "ai";
 
+import type { ApprovalConfig } from "./approval.js";
 import { loadProjectContext } from "./project-context.js";
 import { createSandboxByType } from "./sandbox-factory.js";
 import type { SandboxLifecycle } from "./sandbox.js";
@@ -31,6 +32,7 @@ const explorerModelId = process.env.OPENROUTER_EXPLORER_MODEL ?? modelId;
 const executorModelId = process.env.OPENROUTER_EXECUTOR_MODEL ?? modelId;
 const contextMode =
   process.env.HARNESS_CONTEXT_MODE === "baseline" ? "baseline" : "managed";
+const approvalConfig = parseApprovalConfig();
 const openrouter = createOpenRouter({ apiKey });
 const trace = new RunTrace();
 let lastDelegationResult:
@@ -75,6 +77,7 @@ try {
   const tools = createCodingTools(sandbox, trace, {
     maximumReadCharacters: contextMode === "managed" ? 4_000 : undefined,
     askUser: askUserInTerminal,
+    approvalConfig,
     subagents: {
       explorerModel: openrouter.chat(explorerModelId),
       executorModel: openrouter.chat(executorModelId),
@@ -152,6 +155,7 @@ try {
     explorerModelId,
     executorModelId,
     contextMode,
+    approvalMode: approvalConfig.mode,
     sandboxType: sandbox.type,
     projectContextLoaded: projectContext !== undefined,
     projectContextCharacters: projectContext?.length ?? 0,
@@ -162,6 +166,7 @@ try {
   console.log(`executor model: ${executorModelId}`);
   console.log(`sandbox: ${sandbox.type}`);
   console.log(`context: ${contextMode}`);
+  console.log(`approval: ${formatApprovalConfig(approvalConfig)}`);
   console.log(`trace: ${trace.filePath}\n`);
 
   let streamedText = "";
@@ -296,6 +301,33 @@ try {
 // QuickJS uses a worker internally. Force a clean CLI exit after lifecycle
 // cleanup so an idle runtime worker cannot keep this one-shot process alive.
 process.exit(process.exitCode ?? 0);
+
+function parseApprovalConfig(): ApprovalConfig {
+  const mode = process.env.HARNESS_APPROVAL_MODE;
+  if (mode === undefined || mode === "interactive") {
+    return { mode: "interactive" };
+  }
+  if (mode === "background") {
+    return { mode: "background" };
+  }
+  if (mode === "delegated") {
+    const trust = (process.env.HARNESS_APPROVAL_TRUST ?? "")
+      .split(",")
+      .map((prefix) => prefix.trim())
+      .filter((prefix) => prefix.length > 0);
+    return { mode: "delegated", trust };
+  }
+  throw new Error(
+    "HARNESS_APPROVAL_MODE must be interactive, background, or delegated.",
+  );
+}
+
+function formatApprovalConfig(config: ApprovalConfig): string {
+  if (config.mode !== "delegated") {
+    return config.mode;
+  }
+  return `delegated (${config.trust.length} trusted prefixes)`;
+}
 
 function formatDelegationFallback(result: {
   role: "explorer" | "executor";

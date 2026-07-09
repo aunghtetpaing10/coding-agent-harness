@@ -4,6 +4,7 @@ import { stepCountIs, ToolLoopAgent, tool } from "ai";
 import type { LanguageModel, Tool, ToolSet } from "ai";
 import { z } from "zod";
 
+import { createApproval, type ApprovalConfig } from "./approval.js";
 import type { Sandbox } from "./sandbox.js";
 import type { RunTrace } from "./trace.js";
 
@@ -43,6 +44,7 @@ export function createCodingTools(
   options: {
     maximumReadCharacters?: number;
     askUser?: AskUserHandler;
+    approvalConfig?: ApprovalConfig;
     subagents?: {
       explorerModel: LanguageModel;
       executorModel: LanguageModel;
@@ -55,6 +57,9 @@ export function createCodingTools(
   } = {},
 ) {
   const readLimit = options.maximumReadCharacters;
+  const needsApproval = createApproval(
+    options.approvalConfig ?? { mode: "interactive" },
+  );
   const readFile = tool({
     description: `Read one UTF-8 file from the virtual workspace. Returns the path, content, truncation status, and original character count.
 
@@ -110,7 +115,7 @@ WHEN NOT TO USE: changing one unique span in an existing file (use edit). Inspec
 
 DO NOT USE FOR: small targeted changes (use edit), reading files (use readFile), searching (use grep), or executing code (use bash).
 
-USAGE: path must resolve inside /workspace and content is limited to 20,000 characters. Read an existing file before replacing it. Virtual-workspace writes are auto-approved and traced.
+USAGE: path must resolve inside /workspace and content is limited to 20,000 characters. Read an existing file before replacing it. Writes are traced.
 
 EXAMPLES:
 - Create a script: { "path": "/workspace/check.js", "content": "console.log('ok');" }
@@ -122,13 +127,6 @@ EXAMPLES:
     }),
     execute: async ({ path, content }) => {
       const startedAt = performance.now();
-      await trace.write({
-        type: "approval",
-        tool: "writeFile",
-        policy: "virtual-workspace-write",
-        decision: "auto-approved",
-        path,
-      });
       try {
         await sandbox.writeFile(path, content);
         await trace.write({
@@ -203,7 +201,7 @@ WHEN NOT TO USE: creating a file or replacing most of it (use writeFile). Changi
 
 DO NOT USE FOR: blind edits without first reading the file, multiple-match replacements, new files (use writeFile), or command execution (use bash).
 
-USAGE: path must resolve inside /workspace. oldText must match exactly once, including whitespace; zero or multiple matches return a structured error without writing. oldText and newText are each capped at 10,000 characters. Successful edits are auto-approved and traced.
+USAGE: path must resolve inside /workspace. oldText must match exactly once, including whitespace; zero or multiple matches return a structured error without writing. oldText and newText are each capped at 10,000 characters. Successful edits are traced.
 
 EXAMPLES:
 - Fix an operator: { "path": "/workspace/calculator.js", "oldText": "return a * b;", "newText": "return a / b;" }
@@ -233,13 +231,6 @@ EXAMPLES:
           return { success: false, error, occurrences };
         }
 
-        await trace.write({
-          type: "approval",
-          tool: "edit",
-          policy: "virtual-workspace-write",
-          decision: "auto-approved",
-          path,
-        });
         await sandbox.writeFile(path, content.replace(oldText, newText));
         await trace.write({
           type: "tool_result",
@@ -282,29 +273,38 @@ EXAMPLES:
     }),
     execute: async ({ command }) => {
       const startedAt = performance.now();
-      if (!isAllowedCommand(command)) {
+      if (needsApproval({ command })) {
         await trace.write({
           type: "approval",
           tool: "bash",
-          policy: "verification-command-allowlist",
-          decision: "denied",
           command,
+          decision: "requires-approval",
         });
         return {
           success: false,
-          error:
-            "Command denied by policy. Allowed: js-exec <workspace-file>.ts|js and read-only ls/tree/rg/cat/head/tail/wc commands.",
+          error: `Blocked: "${command}" requires approval.`,
+          requiresApproval: true,
         };
       }
 
-      await trace.write({
-        type: "approval",
-        tool: "bash",
-        policy: "verification-command-allowlist",
-        decision: "auto-approved",
-        command,
-      });
       try {
+        if (!isAllowedCommand(command)) {
+          await trace.write({
+            type: "tool_result",
+            tool: "bash",
+            command,
+            success: false,
+            durationMs: Math.round(performance.now() - startedAt),
+            error:
+              "Command is outside the executable policy for this learning harness.",
+          });
+          return {
+            success: false,
+            error:
+              "Command is outside the executable policy for this learning harness. Allowed: js-exec <workspace-file>.ts|js and read-only ls/tree/rg/cat/head/tail/wc commands.",
+          };
+        }
+
         const result = await sandbox.exec(command);
         const output = {
           success: result.exitCode === 0,
@@ -518,13 +518,6 @@ async function runDeterministicAuthFixture(
     task: description,
     path,
   });
-  await trace.write({
-    type: "approval",
-    tool: "deterministicExecutor",
-    policy: "virtual-workspace-write",
-    decision: "auto-approved",
-    path,
-  });
   await sandbox.writeFile(path, content);
   const verification = await sandbox.exec("js-exec /workspace/auth.js");
   const output = [
@@ -736,7 +729,7 @@ Your job is focused implementation delegated by the parent.
 - Do not explore beyond what is needed to complete the delegated task.
 - Use edit or writeFile for changes, then use bash for allowed verification.
 - Do not introduce deliberate bugs unless the parent explicitly asks for a failing learning fixture. New fixtures should verify successfully.
-- Respect tool-policy denials. Do not retry denied commands.
+- Respect approval and tool-policy denials. Do not retry denied actions unchanged.
 - Report exactly what changed and what verification ran.
 - If the instructions are insufficient or verification is unavailable, stop and report the limitation.`,
     tools: {

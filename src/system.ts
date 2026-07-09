@@ -29,10 +29,19 @@ export function buildSystemPrompt(context: PromptContext): string {
 - Prefer the smallest change that fully satisfies the task.
 - Search before creating files and reuse existing project patterns.
 - Respect tool-policy denials. Adapt to the allowed operation instead of retrying the same denied action.
+- Respect approval gates. If an action is denied, do not retry it unchanged; choose a safer allowed path or report the blocker.
 - Do not add dependencies unless the user explicitly authorizes them.
 - In the just-bash virtual workspace, write self-contained JavaScript. Do not use require, import, node, npm, or Node built-ins such as crypto.
 - Do not introduce deliberate bugs unless the user explicitly asks for a failing learning fixture. New fixtures should verify successfully.
 - Never claim that a file changed or a command ran unless a tool result confirms it.`);
+
+  sections.push(`# Approval Gates
+Bash commands are checked by an approval gate before execution.
+- In interactive mode, safe command prefixes run and unknown commands are blocked.
+- In background mode, approval does not block commands.
+- In delegated mode, only delegated trusted prefixes run.
+
+Approval is separate from command execution. A command can pass approval and still fail or be blocked by the sandbox command policy. Treat both results as execution facts.`);
 
   sections.push(`# Handling Ambiguity
 When the task is ambiguous or has multiple materially different valid approaches:

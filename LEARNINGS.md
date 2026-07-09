@@ -465,3 +465,74 @@ The main lesson is that HITL creates a two-phase control problem: question
 selection and answer continuation. A cheap model may handle the question but
 stall or drift after the answer, so the harness needs continuation guards,
 fallbacks, and verification repair paths.
+
+## Experiment 11: Approval gates
+
+### Hypothesis
+
+The bash allowlist should become a configurable approval gate instead of a
+single hard-coded decision. The useful learning goal is not a full permission
+system yet; it is understanding how one gate can behave differently in local,
+automated, and delegated contexts.
+
+### Mechanism
+
+`src/approval.ts` defines the Vercel Academy shape:
+
+- `{ mode: "interactive" }`
+- `{ mode: "background" }`
+- `{ mode: "delegated"; trust: string[] }`
+
+`createApproval(config)` returns a `needsApproval({ command })` function:
+
+- `interactive` allows known safe prefixes and blocks unknown commands.
+- `background` does not require approval.
+- `delegated` allows only commands that start with one of the delegated trusted
+  prefixes.
+
+The `bash` tool calls this function before execution. If approval is needed, it
+returns a structured blocked result and traces an approval event.
+
+The CLI selects the mode with `HARNESS_APPROVAL_MODE`:
+
+- unset or `interactive`
+- `background`
+- `delegated` with comma-separated `HARNESS_APPROVAL_TRUST` prefixes
+
+### Observation
+
+The approval tests cover the course's three modes:
+
+- Interactive mode allows `ls` and blocks `npm install express`.
+- Background mode does not block `npm install express` at the approval layer.
+- Delegated mode allows only the trusted command prefix.
+
+The harness still keeps command execution policy separate from approval:
+`background` can pass approval, but `node /workspace/math.js` is still blocked
+by the sandbox command policy because this learning backend only supports
+`js-exec` plus read-only inspection commands.
+
+Verification:
+
+```text
+npm run typecheck
+npm test
+```
+
+Both passed after the approval-gate changes.
+
+### Conclusion
+
+Approval gates answer one question: "should this command pause before it runs?"
+That is separate from whether the sandbox can actually execute the command.
+
+This creates a clearer separation:
+
+- Prompt: tells the model how to react to blocked commands.
+- Approval config: changes gate behavior by mode.
+- Bash tool: asks the gate before execution.
+- Sandbox policy: still enforces what this learning backend can safely run.
+
+The important design move is making approval config data, not scattered code.
+That keeps the implementation small while making future user-facing approval,
+session trust, or subagent trust-slicing possible without rewriting every tool.
