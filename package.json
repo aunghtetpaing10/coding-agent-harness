@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "agent": "tsx src/cli.ts",
+    "agent": "node --no-warnings --import tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

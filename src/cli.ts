@@ -25,10 +25,19 @@ if (!prompt) {
 }
 
 const modelId = process.env.OPENROUTER_MODEL ?? "deepseek/deepseek-v4-flash";
+const explorerModelId = process.env.OPENROUTER_EXPLORER_MODEL ?? modelId;
+const executorModelId = process.env.OPENROUTER_EXECUTOR_MODEL ?? modelId;
 const contextMode =
   process.env.HARNESS_CONTEXT_MODE === "baseline" ? "baseline" : "managed";
 const openrouter = createOpenRouter({ apiKey });
 const trace = new RunTrace();
+let lastDelegationResult:
+  | {
+      role: "explorer" | "executor";
+      task: string;
+      output: string;
+    }
+  | undefined;
 
 const sandbox = await createSandboxByType();
 const lifecycle: SandboxLifecycle = {
@@ -53,6 +62,13 @@ try {
   const projectContext = await loadProjectContext(sandbox);
   const tools = createCodingTools(sandbox, trace, {
     maximumReadCharacters: contextMode === "managed" ? 4_000 : undefined,
+    subagents: {
+      explorerModel: openrouter.chat(explorerModelId),
+      executorModel: openrouter.chat(executorModelId),
+      onResult: (result) => {
+        lastDelegationResult = result;
+      },
+    },
   });
 
   const agent = new ToolLoopAgent({
@@ -100,6 +116,8 @@ try {
   await trace.write({
     type: "run_started",
     modelId,
+    explorerModelId,
+    executorModelId,
     contextMode,
     sandboxType: sandbox.type,
     projectContextLoaded: projectContext !== undefined,
@@ -107,6 +125,8 @@ try {
     task: prompt,
   });
   console.log(`model: ${modelId}`);
+  console.log(`explorer model: ${explorerModelId}`);
+  console.log(`executor model: ${executorModelId}`);
   console.log(`sandbox: ${sandbox.type}`);
   console.log(`context: ${contextMode}`);
   console.log(`trace: ${trace.filePath}\n`);
@@ -119,11 +139,18 @@ try {
       chunkMs: 30_000,
     },
     onToolExecutionStart: async ({ toolCall }) => {
-      console.error(`\n[tool] ${toolCall.toolName}`);
+      process.stdout.write(`\n[tool] ${toolCall.toolName}\n`);
       await trace.write({
         type: "tool_call",
         tool: toolCall.toolName,
         input: toolCall.input,
+      });
+    },
+    onToolExecutionEnd: async ({ toolCall, toolOutput }) => {
+      await trace.write({
+        type: "tool_execution_finished",
+        tool: toolCall.toolName,
+        output: toolOutput,
       });
     },
     onStepFinish: async ({ stepNumber, usage, finishReason, toolCalls }) => {
@@ -149,8 +176,20 @@ try {
     },
   });
 
+  let streamedText = "";
   for await (const chunk of result.textStream) {
+    streamedText += chunk;
     process.stdout.write(chunk);
+  }
+  if (streamedText.trim().length === 0 && lastDelegationResult) {
+    const fallback = formatDelegationFallback(lastDelegationResult);
+    await trace.write({
+      type: "delegation_fallback_printed",
+      role: lastDelegationResult.role,
+      task: lastDelegationResult.task,
+      outputCharacters: lastDelegationResult.output.length,
+    });
+    process.stdout.write(fallback);
   }
   process.stdout.write("\n");
 } catch (error) {
@@ -166,3 +205,16 @@ try {
 // QuickJS uses a worker internally. Force a clean CLI exit after lifecycle
 // cleanup so an idle runtime worker cannot keep this one-shot process alive.
 process.exit(process.exitCode ?? 0);
+
+function formatDelegationFallback(result: {
+  role: "explorer" | "executor";
+  task: string;
+  output: string;
+}): string {
+  return [
+    `[delegation fallback] Parent produced no final text after the ${result.role} subagent finished.`,
+    `Delegated task: ${result.task}`,
+    "",
+    result.output,
+  ].join("\n");
+}

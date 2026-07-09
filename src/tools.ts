@@ -1,6 +1,7 @@
 import { posix } from "node:path";
 
-import { tool } from "ai";
+import { stepCountIs, ToolLoopAgent, tool } from "ai";
+import type { LanguageModel, Tool, ToolSet } from "ai";
 import { z } from "zod";
 
 import type { Sandbox } from "./sandbox.js";
@@ -10,10 +11,30 @@ const workspacePathSchema = z.string().refine(isWorkspacePath, {
   message: "Path must resolve inside /workspace.",
 });
 
+type CodingTool = Tool<any, any>;
+type DirectCodingTools = {
+  readFile: CodingTool;
+  grep: CodingTool;
+  writeFile: CodingTool;
+  edit: CodingTool;
+  bash: CodingTool;
+};
+
 export function createCodingTools(
   sandbox: Sandbox,
   trace: RunTrace,
-  options: { maximumReadCharacters?: number } = {},
+  options: {
+    maximumReadCharacters?: number;
+    subagents?: {
+      explorerModel: LanguageModel;
+      executorModel: LanguageModel;
+      onResult?: (result: {
+        role: "explorer" | "executor";
+        task: string;
+        output: string;
+      }) => void | Promise<void>;
+    };
+  } = {},
 ) {
   const readLimit = options.maximumReadCharacters;
   const readFile = tool({
@@ -287,7 +308,208 @@ EXAMPLES:
     },
   });
 
-  return { readFile, grep, writeFile, edit, bash };
+  const directTools = { readFile, grep, writeFile, edit, bash };
+  if (!options.subagents) {
+    return directTools;
+  }
+
+  return {
+    ...directTools,
+    task: createTaskTool(sandbox, trace, directTools, options.subagents),
+  };
+}
+
+export function createTaskTool(
+  sandbox: Sandbox,
+  trace: RunTrace,
+  parentTools: DirectCodingTools,
+  models: {
+    explorerModel: LanguageModel;
+    executorModel: LanguageModel;
+    onResult?: (result: {
+      role: "explorer" | "executor";
+      task: string;
+      output: string;
+    }) => void | Promise<void>;
+  },
+) {
+  return tool({
+    description: `Delegate work to a fresh isolated subagent and return only its final summary.
+
+Explorer (default): read-only research. It can use readFile and grep only. Use it for searching across many files, understanding patterns, gathering project context, and summarizing findings without polluting the parent context.
+
+Executor: focused implementation. It can use readFile, grep, writeFile, edit, and bash. Use it only when the parent can give explicit instructions, constraints, and a known verification step.
+
+WHEN TO USE: research across several files before acting; focused implementation after the parent has decided the approach; mechanical work where the parent benefits from receiving a concise result instead of every intermediate file read.
+
+WHEN NOT TO USE: ambiguous requirements, architectural decisions, user-facing choices, or tasks where the parent can directly finish in one or two tool calls.
+
+DO NOT USE FOR: asking the user questions, speculative broad rewrites, package installation, external network work, or delegating responsibility for decisions the parent should make.
+
+USAGE: pass a concrete description. Set subagentType to "explorer" for read-only investigation or "executor" for scoped edits plus verification. Subagents are created per call and do not keep memory between calls.
+
+EXAMPLES:
+- Research: { "subagentType": "explorer", "description": "Find every file that defines or uses the clamp function and summarize the relevant behavior." }
+- Implement: { "subagentType": "executor", "description": "In /workspace/math.js, fix clamp so boundary tests pass, then run js-exec /workspace/math.js and report the result." }
+- Sequence: first ask explorer to locate the relevant files, then ask executor to make the decided change.`,
+    inputSchema: z.object({
+      description: z
+        .string()
+        .min(1)
+        .max(2_000)
+        .describe("Precise task instructions for the subagent."),
+      subagentType: z
+        .enum(["explorer", "executor"])
+        .default("explorer")
+        .describe("Use explorer for read-only research or executor for scoped edits."),
+    }),
+    execute: async ({ description, subagentType }, { abortSignal }) => {
+      if (subagentType === "executor") {
+        const output = await runSubagent(
+          trace,
+          subagentType,
+          buildExecutor(sandbox, parentTools, models.executorModel),
+          description,
+          abortSignal,
+        );
+        await models.onResult?.({ role: subagentType, task: description, output });
+        return output;
+      }
+
+      const output = await runSubagent(
+        trace,
+        subagentType,
+        buildExplorer(sandbox, parentTools, models.explorerModel),
+        description,
+        abortSignal,
+      );
+      await models.onResult?.({ role: subagentType, task: description, output });
+      return output;
+    },
+  });
+}
+
+function buildExplorer(
+  sandbox: Sandbox,
+  parentTools: Pick<DirectCodingTools, "readFile" | "grep">,
+  model: LanguageModel,
+) {
+  return new ToolLoopAgent({
+    model,
+    instructions: `You are an explorer subagent working in ${sandbox.workingDirectory}.
+
+Your job is read-only investigation.
+- Use readFile and grep to gather evidence.
+- Do not ask questions.
+- Do not propose edits unless asked to identify likely changes.
+- Return a concise summary with file paths and concrete findings.
+- Do not claim tests pass or fail unless you actually ran an allowed verification command.
+- If you cannot answer with the available tools, say exactly what is missing.`,
+    tools: {
+      readFile: parentTools.readFile,
+      grep: parentTools.grep,
+    },
+    stopWhen: stepCountIs(5),
+    maxOutputTokens: 800,
+  });
+}
+
+function buildExecutor(
+  sandbox: Sandbox,
+  parentTools: DirectCodingTools,
+  model: LanguageModel,
+) {
+  return new ToolLoopAgent({
+    model,
+    instructions: `You are an executor subagent working in ${sandbox.workingDirectory}.
+
+Your job is focused implementation delegated by the parent.
+- Follow the parent's instructions precisely.
+- Do not ask questions.
+- Do not explore beyond what is needed to complete the delegated task.
+- Use edit or writeFile for changes, then use bash for allowed verification.
+- Respect tool-policy denials. Do not retry denied commands.
+- Report exactly what changed and what verification ran.
+- If the instructions are insufficient or verification is unavailable, stop and report the limitation.`,
+    tools: {
+      readFile: parentTools.readFile,
+      grep: parentTools.grep,
+      writeFile: parentTools.writeFile,
+      edit: parentTools.edit,
+      bash: parentTools.bash,
+    },
+    stopWhen: stepCountIs(15),
+    maxOutputTokens: 700,
+  });
+}
+
+async function runSubagent<TTools extends ToolSet>(
+  trace: RunTrace,
+  role: "explorer" | "executor",
+  agent: ToolLoopAgent<never, TTools>,
+  description: string,
+  abortSignal: AbortSignal | undefined,
+) {
+  await trace.write({
+    type: "subagent_started",
+    role,
+    task: description,
+  });
+
+  try {
+    const result = await agent.generate({
+      prompt: description,
+      abortSignal,
+      timeout: {
+        totalMs: role === "executor" ? 120_000 : 60_000,
+        stepMs: 45_000,
+        chunkMs: 30_000,
+      },
+      onToolExecutionStart: async ({ toolCall }) => {
+        await trace.write({
+          type: "subagent_tool_call",
+          role,
+          tool: toolCall.toolName,
+          input: toolCall.input,
+        });
+      },
+      onStepFinish: async ({ stepNumber, usage, finishReason, toolCalls }) => {
+        await trace.write({
+          type: "subagent_step_finished",
+          role,
+          stepNumber,
+          finishReason,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.totalTokens,
+          tools: toolCalls.map((call) => call.toolName),
+        });
+      },
+      onFinish: async ({ usage, steps, finishReason }) => {
+        await trace.write({
+          type: "subagent_finished",
+          role,
+          steps: steps.length,
+          finishReason,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.totalTokens,
+        });
+      },
+    });
+
+    return result.text
+      ? `[${role}: ${result.steps.length} steps]\n${result.text}`
+      : `(no response from ${role})`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await trace.write({
+      type: "subagent_error",
+      role,
+      error: message,
+    });
+    return `${role} error: ${message}`;
+  }
 }
 
 function isWorkspacePath(path: string): boolean {

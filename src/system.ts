@@ -15,7 +15,10 @@ export function buildSystemPrompt(context: PromptContext): string {
 - Use tools to inspect, change, and verify the workspace before answering.
 - Perform requested work; do not merely explain what you would do.
 - Inspect relevant evidence before making claims about files or behavior.
-- Available tools: ${context.toolNames.join(", ")}`,
+- Available tools: ${context.toolNames.join(", ")}
+- Use task/explorer for research across several files when the parent does not need every intermediate read in context.
+- Use task/executor only for focused implementation with explicit constraints and a known verification step.
+- Keep ambiguous requirements, architectural choices, and user questions in the parent agent.`,
   ];
 
   if (context.gitBranch) {
