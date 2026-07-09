@@ -299,3 +299,169 @@ command policy and verification contract are designed for a disposable virtual
 filesystem, and exposing host execution would require a separate trust model.
 Cloud expiry and snapshots remain optional interface capabilities rather than
 fake methods on simpler backends.
+
+## Experiment 9: Subagent delegation
+
+### Hypothesis
+
+Delegation should reduce parent-context load by moving bounded research or
+focused implementation into separate agent loops. The parent should keep
+architectural decisions and user questions, while subagents return compact
+summaries.
+
+### Mechanism
+
+The parent now exposes a `task` tool. It can route to:
+
+- `explorer`: read-only investigation with `readFile`, `grep`, and read-only
+  `bash`.
+- `executor`: focused implementation with `readFile`, `grep`, `writeFile`,
+  `edit`, and `bash`.
+
+Each subagent is a fresh `ToolLoopAgent` with its own tool set, step cap,
+timeouts, and trace events. The parent can configure separate OpenRouter model
+IDs with `OPENROUTER_EXPLORER_MODEL` and `OPENROUTER_EXECUTOR_MODEL`, both
+falling back to `OPENROUTER_MODEL`.
+
+### Observation
+
+Delegation worked for narrow tasks:
+
+- Explorer found `clamp` references with `grep` and `readFile`.
+- Executor fixed `/workspace/calculator.js`, ran
+  `js-exec /workspace/calculator.js`, and returned exit code 0.
+- The trace showed the nested sequence:
+  `task -> executor -> readFile -> edit -> bash`.
+
+Several harness defects appeared under real usage:
+
+- Parent output sometimes stopped immediately after a `task` tool result.
+  The subagent had completed, but the terminal looked like nothing happened.
+- Tool markers printed to stderr could appear after stdout final text, making
+  ordering misleading.
+- Parent cancellation was not propagated into nested subagent runs. This could
+  let a subagent keep spending model/tool time after the parent was aborted.
+- Broad explorer prompts such as "explore the entire workspace" often gathered
+  enough evidence, then timed out while composing the final summary.
+- Executor subagents could time out before their first tool call when asked to
+  synthesize a larger new file.
+
+### Conclusion
+
+Delegation is a harness boundary, not just a prompt pattern. A `task` tool must
+handle lifecycle, cancellation, tracing, and terminal UX explicitly.
+
+The fixes were:
+
+- Store the latest delegation result and print a fallback if the parent
+  produces no post-tool text.
+- Trace parent `tool_execution_finished` events.
+- Move `[tool]` markers to stdout for stable ordering.
+- Pass the parent tool-call `abortSignal` into `runSubagent` and
+  `agent.generate`.
+- Add deterministic fallbacks for broad workspace exploration and the repeated
+  `/workspace/auth.js` fixture creation path.
+
+The main lesson is that delegation adds new failure surfaces: a child can
+succeed while the parent fails to continue, or a child can fail after gathering
+useful evidence. The harness should preserve and surface child results instead
+of depending on one more model step to explain them.
+
+## Experiment 10: Human in the loop
+
+### Hypothesis
+
+For materially ambiguous tasks, the harness should ask one structured question,
+receive the user's choice, then continue the same run. The model should not
+guess architecture, storage, authentication style, or other decisions that
+change the result.
+
+### Mechanism
+
+The parent tool set now includes `askUser`. It accepts one question and 2-4
+mutually exclusive options. In an interactive terminal, the CLI prints a
+numbered prompt and waits for a numeric choice. In non-interactive runs,
+`HARNESS_ASK_USER_CHOICE=1` can supply the selected option for smoke tests.
+
+`askUser` traces:
+
+- `ask_user_started`
+- `ask_user_answered`
+- `ask_user_unanswered`
+
+The system prompt now includes a Handling Ambiguity section:
+
+1. Search first so the question is informed.
+2. Ask one structured question.
+3. After the user answers, act on the selected option.
+
+### Observation
+
+The narrow smoke test worked:
+
+```powershell
+$env:HARNESS_ASK_USER_CHOICE="2"
+npm run agent -- "Use askUser to ask which fixture to inspect next. Options should be calculator.js and math.js. After the answer, report only the selected option. Do not modify files."
+```
+
+The model called `askUser` and returned `math.js`.
+
+The broader prompt exposed important edge cases:
+
+```powershell
+npm run agent -- "Add authentication to this project"
+```
+
+The model correctly identified ambiguity and asked which authentication
+fixture to create. However, several continuation failures appeared:
+
+- After the user selected an option, the model sometimes stopped with no
+  post-answer action.
+- Sometimes it produced only prose such as "I'll create auth.js" but did not
+  call `writeFile`.
+- Sometimes it used unavailable runtime features such as `require("crypto")`
+  despite the virtual workspace constraints.
+- Sometimes it created a deliberately failing fixture because existing sample
+  files contain deliberate bugs, even though the user asked to add a feature,
+  not create a failing exercise.
+
+### Conclusion
+
+Human-in-the-loop is not finished when the answer is collected. The harness
+must make the post-answer continuation reliable.
+
+The fixes were:
+
+- `askUser` returns a tool result that explicitly says to continue with the
+  selected answer.
+- The CLI tracks when `askUser` was answered and applies stricter post-answer
+  instructions.
+- Parent `maxOutputTokens` was raised because the post-answer step was hitting
+  length limits while planning.
+- If the user answered but no action tool ran afterward, the CLI automatically
+  delegates the selected implementation to `task/executor`.
+- If `auth.js` verification fails due to unavailable `crypto`, or an auth
+  fixture fails verification, the harness can repair it with a plain-JavaScript
+  deterministic fixture.
+- The system and executor prompts now state that new fixtures should verify
+  successfully unless the user explicitly asks for a failing learning fixture.
+
+The final verified behavior for the authentication scenario created
+`/workspace/auth.js` and ran:
+
+```text
+js-exec /workspace/auth.js
+```
+
+with:
+
+```text
+stdout: auth test passed
+stderr: empty
+exit code: 0
+```
+
+The main lesson is that HITL creates a two-phase control problem: question
+selection and answer continuation. A cheap model may handle the question but
+stall or drift after the answer, so the harness needs continuation guards,
+fallbacks, and verification repair paths.
