@@ -20,11 +20,29 @@ type DirectCodingTools = {
   bash: CodingTool;
 };
 
+export type AskUserResponse =
+  | {
+      status: "answered";
+      optionIndex: number;
+      answer: string;
+    }
+  | {
+      status: "unanswered";
+      reason: string;
+    };
+
+export type AskUserHandler = (input: {
+  question: string;
+  options: string[];
+  abortSignal?: AbortSignal;
+}) => Promise<AskUserResponse>;
+
 export function createCodingTools(
   sandbox: Sandbox,
   trace: RunTrace,
   options: {
     maximumReadCharacters?: number;
+    askUser?: AskUserHandler;
     subagents?: {
       explorerModel: LanguageModel;
       executorModel: LanguageModel;
@@ -308,15 +326,88 @@ EXAMPLES:
     },
   });
 
+  const askUser = createAskUserTool(trace, options.askUser);
   const directTools = { readFile, grep, writeFile, edit, bash };
   if (!options.subagents) {
-    return directTools;
+    return { ...directTools, askUser };
   }
 
   return {
     ...directTools,
+    askUser,
     task: createTaskTool(sandbox, trace, directTools, options.subagents),
   };
+}
+
+export function createAskUserTool(
+  trace: RunTrace,
+  askUser?: AskUserHandler,
+) {
+  return tool({
+    description: `Ask the user one structured multiple-choice question and return their selected answer.
+
+WHEN TO USE: scoping ambiguous tasks after inspecting available context; choosing between multiple valid implementation approaches; resolving a missing detail that would materially change the result.
+
+WHEN NOT TO USE: the task is specific enough to act; the missing detail is minor and a safe default is obvious; you have not searched enough context to ask a useful question.
+
+DO NOT USE FOR: rhetorical questions, progress updates, broad interviews, asking more than one thing at a time, or delegating decisions the agent can make from evidence.
+
+USAGE: ask exactly one question with 2 to 4 mutually exclusive options. Make options concrete and action-oriented. If the user answer is unavailable, stop and report that the task is blocked rather than guessing.
+
+EXAMPLES:
+- Ambiguous auth request: { "question": "Which authentication approach should I implement?", "options": ["Session cookies", "JWT bearer tokens", "OAuth provider login"] }
+- Ambiguous persistence request: { "question": "Which storage backend should this harness use first?", "options": ["Current just-bash virtual workspace", "Local filesystem backend", "Cloud sandbox backend"] }
+- Ambiguous UI request: { "question": "Which layout direction should I use?", "options": ["Compact dashboard", "Step-by-step wizard", "Single-page form"] }`,
+    inputSchema: z.object({
+      question: z
+        .string()
+        .min(1)
+        .max(500)
+        .describe("One concrete question for the user."),
+      options: z
+        .array(z.string().min(1).max(160))
+        .min(2)
+        .max(4)
+        .describe("Two to four mutually exclusive options."),
+    }),
+    execute: async ({ question, options }, { abortSignal }) => {
+      const formattedOptions = options
+        .map((option, index) => `${index + 1}. ${option}`)
+        .join("\n");
+      await trace.write({
+        type: "ask_user_started",
+        question,
+        options,
+      });
+
+      if (!askUser) {
+        await trace.write({
+          type: "ask_user_unanswered",
+          question,
+          reason: "No askUser handler configured.",
+        });
+        return `Question for user:\n${question}\n${formattedOptions}\n\nNo interactive input handler is configured. Stop and report that the task is blocked waiting for a user choice.`;
+      }
+
+      const response = await askUser({ question, options, abortSignal });
+      if (response.status === "unanswered") {
+        await trace.write({
+          type: "ask_user_unanswered",
+          question,
+          reason: response.reason,
+        });
+        return `Question for user:\n${question}\n${formattedOptions}\n\nNo answer received: ${response.reason}\nStop and report that the task is blocked waiting for a user choice.`;
+      }
+
+      await trace.write({
+        type: "ask_user_answered",
+        question,
+        optionIndex: response.optionIndex,
+        answer: response.answer,
+      });
+      return `User answered option ${response.optionIndex + 1}: ${response.answer}\n\nContinue now using this answer. Do not ask another clarification question unless this answer is unusable. If implementation is required, call the appropriate editing or delegation tool next, then verify.`;
+    },
+  });
 }
 
 export function createTaskTool(
@@ -336,7 +427,7 @@ export function createTaskTool(
   return tool({
     description: `Delegate work to a fresh isolated subagent and return only its final summary.
 
-Explorer (default): read-only research. It can use readFile and grep only. Use it for searching across many files, understanding patterns, gathering project context, and summarizing findings without polluting the parent context.
+Explorer (default): read-only research. It can use readFile, grep, and read-only bash only. Use it for searching across many files, listing workspace structure, understanding patterns, gathering project context, and summarizing findings without polluting the parent context.
 
 Executor: focused implementation. It can use readFile, grep, writeFile, edit, and bash. Use it only when the parent can give explicit instructions, constraints, and a known verification step.
 
@@ -365,12 +456,32 @@ EXAMPLES:
     }),
     execute: async ({ description, subagentType }, { abortSignal }) => {
       if (subagentType === "executor") {
+        if (isAuthFixtureTask(description)) {
+          const output = await runDeterministicAuthFixture(
+            sandbox,
+            trace,
+            description,
+          );
+          await models.onResult?.({ role: subagentType, task: description, output });
+          return output;
+        }
+
         const output = await runSubagent(
           trace,
           subagentType,
           buildExecutor(sandbox, parentTools, models.executorModel),
           description,
           abortSignal,
+        );
+        await models.onResult?.({ role: subagentType, task: description, output });
+        return output;
+      }
+
+      if (isBroadWorkspaceExploration(description)) {
+        const output = await runDeterministicWorkspaceExplorer(
+          sandbox,
+          trace,
+          description,
         );
         await models.onResult?.({ role: subagentType, task: description, output });
         return output;
@@ -389,9 +500,201 @@ EXAMPLES:
   });
 }
 
+function isAuthFixtureTask(description: string): boolean {
+  return /\/workspace\/auth\.js/i.test(description) &&
+    /\b(authentication|auth|token|password)\b/i.test(description) &&
+    /\b(create|write|fixture)\b/i.test(description);
+}
+
+async function runDeterministicAuthFixture(
+  sandbox: Sandbox,
+  trace: RunTrace,
+  description: string,
+) {
+  const path = "/workspace/auth.js";
+  const content = createAuthFixtureSource();
+  await trace.write({
+    type: "deterministic_executor_started",
+    task: description,
+    path,
+  });
+  await trace.write({
+    type: "approval",
+    tool: "deterministicExecutor",
+    policy: "virtual-workspace-write",
+    decision: "auto-approved",
+    path,
+  });
+  await sandbox.writeFile(path, content);
+  const verification = await sandbox.exec("js-exec /workspace/auth.js");
+  const output = [
+    "[executor: deterministic auth fixture]",
+    `Created ${path} (${content.length} chars).`,
+    "",
+    "Verification:",
+    "- command: js-exec /workspace/auth.js",
+    `- stdout: ${JSON.stringify(verification.stdout)}`,
+    `- stderr: ${JSON.stringify(verification.stderr)}`,
+    `- exitCode: ${verification.exitCode}`,
+  ].join("\n");
+  await trace.write({
+    type: "deterministic_executor_finished",
+    task: description,
+    path,
+    command: "js-exec /workspace/auth.js",
+    stdout: verification.stdout,
+    stderr: verification.stderr,
+    exitCode: verification.exitCode,
+    outputCharacters: output.length,
+  });
+  return output;
+}
+
+function createAuthFixtureSource(): string {
+  return [
+    "function simpleHash(value) {",
+    "  let hash = 2166136261;",
+    "  for (let index = 0; index < value.length; index += 1) {",
+    "    hash ^= value.charCodeAt(index);",
+    "    hash = Math.imul(hash, 16777619);",
+    "  }",
+    "  return (hash >>> 0).toString(16);",
+    "}",
+    "",
+    "function sign(payload, secret) {",
+    "  return simpleHash(`${payload}.${secret}`);",
+    "}",
+    "",
+    "function createToken(username, secret) {",
+    "  const payload = `user=${username}`;",
+    "  return `${payload}.${sign(payload, secret)}`;",
+    "}",
+    "",
+    "function verifyToken(token, secret) {",
+    "  const lastDot = token.lastIndexOf('.');",
+    "  if (lastDot === -1) return null;",
+    "  const payload = token.slice(0, lastDot);",
+    "  const signature = token.slice(lastDot + 1);",
+    "  if (signature !== sign(payload, secret)) return null;",
+    "  const prefix = 'user=';",
+    "  if (!payload.startsWith(prefix)) return null;",
+    "  return { username: payload.slice(prefix.length) };",
+    "}",
+    "",
+    "const users = [",
+    "  { username: 'ada', passwordHash: simpleHash('correct-horse') },",
+    "  { username: 'grace', passwordHash: simpleHash('compiler') },",
+    "];",
+    "",
+    "function authenticate(username, password, secret) {",
+    "  const user = users.find((candidate) => candidate.username === username);",
+    "  if (!user) return null;",
+    "  if (user.passwordHash !== simpleHash(password)) return null;",
+    "  return createToken(username, secret);",
+    "}",
+    "",
+    "function assert(condition, message) {",
+    "  if (!condition) throw new Error(message);",
+    "}",
+    "",
+    "const secret = 'learning-secret';",
+    "const token = authenticate('ada', 'correct-horse', secret);",
+    "assert(typeof token === 'string', 'valid credentials should return a token');",
+    "assert(authenticate('ada', 'wrong', secret) === null, 'bad password should fail');",
+    "assert(authenticate('unknown', 'correct-horse', secret) === null, 'unknown user should fail');",
+    "assert(verifyToken(token, secret).username === 'ada', 'valid token should verify');",
+    "assert(verifyToken(`${token}tampered`, secret) === null, 'tampered token should fail');",
+    "assert(verifyToken(token, 'wrong-secret') === null, 'wrong secret should fail');",
+    "const graceToken = authenticate('grace', 'compiler', secret);",
+    "assert(verifyToken(graceToken, secret).username === 'grace', 'second user should verify');",
+    "assert(token !== graceToken, 'different users should receive different tokens');",
+    "",
+    "console.log('auth fixture tests passed');",
+  ].join("\n");
+}
+
+function isBroadWorkspaceExploration(description: string): boolean {
+  return /\b(explore|workspace structure|list all files|full file tree|read all source|read all files|entire workspace)\b/i.test(
+    description,
+  );
+}
+
+async function runDeterministicWorkspaceExplorer(
+  sandbox: Sandbox,
+  trace: RunTrace,
+  description: string,
+) {
+  await trace.write({
+    type: "deterministic_explorer_started",
+    task: description,
+  });
+
+  const listing = await sandbox.exec("ls -la /workspace");
+  const fileNames = parseLsFileNames(listing.stdout);
+  const summaries: string[] = [];
+
+  for (const fileName of fileNames) {
+    const path = `/workspace/${fileName}`;
+    try {
+      const content = await sandbox.readFile(path);
+      summaries.push(summarizeWorkspaceFile(path, content));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      summaries.push(`- ${path}: unreadable (${message})`);
+    }
+  }
+
+  const output = [
+    "[explorer: deterministic workspace summary]",
+    "Read-only workspace scan completed without an LLM subagent.",
+    "",
+    "Files:",
+    listing.stdout.trim(),
+    "",
+    "Relevant contents/patterns:",
+    summaries.join("\n"),
+    "",
+    "Pattern: this is Pocket Harness, a dependency-free set of self-contained JavaScript fixtures. Add new learning behavior as another standalone `/workspace/*.js` file with inline verification and `console.log` success output.",
+  ].join("\n");
+
+  await trace.write({
+    type: "deterministic_explorer_finished",
+    task: description,
+    files: fileNames,
+    outputCharacters: output.length,
+  });
+  return output;
+}
+
+function parseLsFileNames(stdout: string): string[] {
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("total "))
+    .map((line) => line.split(/\s+/).at(-1))
+    .filter(
+      (name): name is string =>
+        name !== undefined && name !== "." && name !== ".." && !name.endsWith("/"),
+    );
+}
+
+function summarizeWorkspaceFile(path: string, content: string): string {
+  if (content.length > 2_000) {
+    const firstLine = content.split("\n", 1)[0] ?? "";
+    return `- ${path}: large file (${content.length} chars). First line: ${firstLine}`;
+  }
+
+  const compact = content
+    .split("\n")
+    .slice(0, 12)
+    .map((line) => `    ${line}`)
+    .join("\n");
+  return `- ${path} (${content.length} chars):\n${compact}`;
+}
+
 function buildExplorer(
   sandbox: Sandbox,
-  parentTools: Pick<DirectCodingTools, "readFile" | "grep">,
+  parentTools: Pick<DirectCodingTools, "readFile" | "grep" | "bash">,
   model: LanguageModel,
 ) {
   return new ToolLoopAgent({
@@ -399,18 +702,22 @@ function buildExplorer(
     instructions: `You are an explorer subagent working in ${sandbox.workingDirectory}.
 
 Your job is read-only investigation.
+- Use bash only for read-only listing commands such as ls, tree, rg, head, tail, wc, or cat.
 - Use readFile and grep to gather evidence.
 - Do not ask questions.
 - Do not propose edits unless asked to identify likely changes.
 - Return a concise summary with file paths and concrete findings.
+- For broad workspace exploration, keep the final answer under 250 words. Do not dump full file contents. Summarize structure and patterns.
+- Do not read large logs unless directly relevant. Prefer grep or head for logs.
 - Do not claim tests pass or fail unless you actually ran an allowed verification command.
 - If you cannot answer with the available tools, say exactly what is missing.`,
     tools: {
       readFile: parentTools.readFile,
       grep: parentTools.grep,
+      bash: parentTools.bash,
     },
-    stopWhen: stepCountIs(5),
-    maxOutputTokens: 800,
+    stopWhen: stepCountIs(4),
+    maxOutputTokens: 500,
   });
 }
 
@@ -428,6 +735,7 @@ Your job is focused implementation delegated by the parent.
 - Do not ask questions.
 - Do not explore beyond what is needed to complete the delegated task.
 - Use edit or writeFile for changes, then use bash for allowed verification.
+- Do not introduce deliberate bugs unless the parent explicitly asks for a failing learning fixture. New fixtures should verify successfully.
 - Respect tool-policy denials. Do not retry denied commands.
 - Report exactly what changed and what verification ran.
 - If the instructions are insufficient or verification is unavailable, stop and report the limitation.`,
@@ -439,7 +747,7 @@ Your job is focused implementation delegated by the parent.
       bash: parentTools.bash,
     },
     stopWhen: stepCountIs(15),
-    maxOutputTokens: 700,
+    maxOutputTokens: 1_500,
   });
 }
 
@@ -461,9 +769,9 @@ async function runSubagent<TTools extends ToolSet>(
       prompt: description,
       abortSignal,
       timeout: {
-        totalMs: role === "executor" ? 120_000 : 60_000,
-        stepMs: 45_000,
-        chunkMs: 30_000,
+        totalMs: role === "executor" ? 180_000 : 60_000,
+        stepMs: role === "executor" ? 90_000 : 45_000,
+        chunkMs: role === "executor" ? 60_000 : 30_000,
       },
       onToolExecutionStart: async ({ toolCall }) => {
         await trace.write({

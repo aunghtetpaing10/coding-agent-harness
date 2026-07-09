@@ -47,4 +47,17 @@ describe("buildSystemPrompt", () => {
     expect(prompt).toContain("successful tool result");
     expect(prompt).toContain("Scope the final claim");
   });
+
+  it("instructs the agent to ask structured questions for material ambiguity", () => {
+    const prompt = buildSystemPrompt({
+      ...baseContext,
+      toolNames: [...baseContext.toolNames, "askUser"],
+    });
+
+    expect(prompt).toContain("# Handling Ambiguity");
+    expect(prompt).toContain("Search the workspace");
+    expect(prompt).toContain("Use askUser");
+    expect(prompt).toContain("Do not guess");
+    expect(prompt).toContain("Do not use askUser for specific tasks");
+  });
 });

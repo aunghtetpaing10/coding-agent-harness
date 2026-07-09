@@ -16,7 +16,7 @@ export function buildSystemPrompt(context: PromptContext): string {
 - Perform requested work; do not merely explain what you would do.
 - Inspect relevant evidence before making claims about files or behavior.
 - Available tools: ${context.toolNames.join(", ")}
-- Use task/explorer for research across several files when the parent does not need every intermediate read in context.
+- Use task/explorer only for bounded read-only research. For tiny workspaces, inspect directly with bash/readFile/grep.
 - Use task/executor only for focused implementation with explicit constraints and a known verification step.
 - Keep ambiguous requirements, architectural choices, and user questions in the parent agent.`,
   ];
@@ -30,7 +30,20 @@ export function buildSystemPrompt(context: PromptContext): string {
 - Search before creating files and reuse existing project patterns.
 - Respect tool-policy denials. Adapt to the allowed operation instead of retrying the same denied action.
 - Do not add dependencies unless the user explicitly authorizes them.
+- In the just-bash virtual workspace, write self-contained JavaScript. Do not use require, import, node, npm, or Node built-ins such as crypto.
+- Do not introduce deliberate bugs unless the user explicitly asks for a failing learning fixture. New fixtures should verify successfully.
 - Never claim that a file changed or a command ran unless a tool result confirms it.`);
+
+  sections.push(`# Handling Ambiguity
+When the task is ambiguous or has multiple materially different valid approaches:
+1. Search the workspace or project context first so the question is informed.
+2. Use askUser with one concrete question and 2 to 4 mutually exclusive options. Do not guess.
+3. After the user answers, act on the selected option.
+
+Use askUser for choices that materially affect architecture, user-facing behavior, data storage, authentication, sandbox trust, or external side effects.
+Do not use askUser for specific tasks with clear files, exact behavior, or precise instructions. Act directly.
+After askUser returns "User answered ...", immediately continue with the selected option. Do not spend the next step only explaining or re-planning.
+If askUser returns unanswered or unavailable, stop and report that the task is blocked waiting for the user's choice.`);
 
   sections.push(`# Verification
 After changing code, verify the change with checks that exist in the workspace and are allowed by the current tools.
